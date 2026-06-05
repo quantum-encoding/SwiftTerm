@@ -298,7 +298,10 @@ extension TerminalView {
     {
         urlAttributes = [:]
         attributes = [:]
-        
+        #if os(macOS)
+        renderEpoch &+= 1   // resolved colors are baked into cached CTLines
+        #endif
+
         terminal.updateFullScreen ()
         queuePendingDisplay()
     }
@@ -793,6 +796,9 @@ extension TerminalView {
 
     func invalidateLinkHighlight(oldRange: [Terminal.LinkMatch.RowRange]?, newRange: [Terminal.LinkMatch.RowRange]?)
     {
+        #if os(macOS)
+        renderEpoch &+= 1   // link underline is an attribute, not a content change
+        #endif
         let oldRows = Set(oldRange?.map(\.row) ?? [])
         let newRows = Set(newRange?.map(\.row) ?? [])
         for row in oldRows.union(newRows) {
@@ -1143,9 +1149,43 @@ extension TerminalView {
     }
 
     
+#if os(macOS)
+    // Returns the row's attributed segments + prepared CTLines, served from the
+    // per-line cache when the line is unchanged (same renderVersion + epoch) and
+    // not part of an active selection. See `rowRenderCache` for the rationale.
+    func cachedLineRender(row: Int, line: BufferLine, cols: Int)
+        -> (ViewLineInfo, [(segment: ViewLineSegment, ctLine: CTLine, runs: [CTRun])])
+    {
+        let selected = selectedColumnsRange(row: row, cols: cols) != nil
+        let key = ObjectIdentifier(line)
+        if !selected, var hit = rowRenderCache[key], hit.version == line.renderVersion, hit.epoch == renderEpoch {
+            hit.lastSeen = drawFrameCounter
+            rowRenderCache[key] = hit
+            cacheHits += 1
+            return (hit.info, hit.prepared)
+        }
+        cacheMisses += 1
+        let info = buildAttributedString(row: row, line: line, cols: cols)
+        let prepared = info.segments.compactMap { segment -> (segment: ViewLineSegment, ctLine: CTLine, runs: [CTRun])? in
+            guard segment.attributedString.length > 0 else { return nil }
+            let ctLine = CTLineCreateWithAttributedString(segment.attributedString)
+            guard let runs = CTLineGetGlyphRuns(ctLine) as? [CTRun] else { return nil }
+            return (segment, ctLine, runs)
+        }
+        if !selected {
+            rowRenderCache[key] = CachedRow(version: line.renderVersion, epoch: renderEpoch,
+                                            info: info, prepared: prepared, lastSeen: drawFrameCounter)
+        }
+        return (info, prepared)
+    }
+#endif
+
     // TODO: this should not render any lines outside the dirtyRect
     func drawTerminalContents (dirtyRect: TTRect, context: CGContext, bufferOffset: Int)
     {
+        #if os(macOS)
+        drawFrameCounter &+= 1
+        #endif
         let lineDescent = CTFontGetDescent(fontSet.normal)
         let lineLeading = CTFontGetLeading(fontSet.normal)
         let yOffset = ceil(lineDescent+lineLeading)
@@ -1243,7 +1283,19 @@ extension TerminalView {
             } 
             #endif
             let line = displayBuffer.lines [row]
-            let lineInfo = buildAttributedString(row: row, line: line, cols: displayBuffer.cols)
+            let lineInfo: ViewLineInfo
+            let preparedSegments: [(segment: ViewLineSegment, ctLine: CTLine, runs: [CTRun])]
+            #if os(macOS)
+            (lineInfo, preparedSegments) = cachedLineRender(row: row, line: line, cols: displayBuffer.cols)
+            #else
+            lineInfo = buildAttributedString(row: row, line: line, cols: displayBuffer.cols)
+            preparedSegments = lineInfo.segments.compactMap { segment in
+                guard segment.attributedString.length > 0 else { return nil }
+                let ctLine = CTLineCreateWithAttributedString(segment.attributedString)
+                guard let runs = CTLineGetGlyphRuns(ctLine) as? [CTRun] else { return nil }
+                return (segment, ctLine, runs)
+            }
+            #endif
             let rowBase = lineOrigin.y + cellDimension.height
             var underTextImages: [AppleImage] = []
             var overTextKittyImages: [AppleImage] = []
@@ -1275,14 +1327,8 @@ extension TerminalView {
                 overTextKittyImages.sort(by: sortKitty)
             }
 
-            // Pre-create CTLines and runs once per row to avoid duplicate creation
-            let preparedSegments: [(segment: ViewLineSegment, ctLine: CTLine, runs: [CTRun])] =
-                lineInfo.segments.compactMap { segment in
-                    guard segment.attributedString.length > 0 else { return nil }
-                    let ctLine = CTLineCreateWithAttributedString(segment.attributedString)
-                    guard let runs = CTLineGetGlyphRuns(ctLine) as? [CTRun] else { return nil }
-                    return (segment, ctLine, runs)
-                }
+            // preparedSegments (CTLines + runs) computed above — cached per line
+            // on macOS, rebuilt inline on iOS.
 
             // Background fill loop — uses cached CTLines
             context.saveGState()
@@ -1385,17 +1431,22 @@ extension TerminalView {
                     let runFont = runAttributes[.font] as! TTFont
                     let startColumn = prepared.segment.column + (processedGlyphs * prepared.segment.columnWidth)
 
-                    let runGlyphs = [CGGlyph](unsafeUninitializedCapacity: runGlyphsCount) { (bufferPointer, count) in
-                        CTRunGetGlyphs(run, CFRange(), bufferPointer.baseAddress!)
-                        count = runGlyphsCount
+                    // Reused scratch for the two CoreText reads (grow-only); the
+                    // final `positions` stays exactly sized for drawRunAttributes.
+                    if scratchGlyphs.count < runGlyphsCount {
+                        scratchGlyphs = [CGGlyph](repeating: 0, count: runGlyphsCount)
+                        scratchCTPositions = [CGPoint](repeating: .zero, count: runGlyphsCount)
                     }
-
-                    var coreTextPositions = [CGPoint](repeating: .zero, count: runGlyphsCount)
-                    CTRunGetPositions(run, CFRange(), &coreTextPositions)
+                    scratchGlyphs.withUnsafeMutableBufferPointer {
+                        CTRunGetGlyphs(run, CFRange(), $0.baseAddress!)
+                    }
+                    scratchCTPositions.withUnsafeMutableBufferPointer {
+                        CTRunGetPositions(run, CFRange(), $0.baseAddress!)
+                    }
 
                     var positions = [CGPoint](repeating: .zero, count: runGlyphsCount)
                     for i in 0..<runGlyphsCount {
-                        let ctPosition = coreTextPositions[i]
+                        let ctPosition = scratchCTPositions[i]
                         let glyphColumn = startColumn + (i * prepared.segment.columnWidth)
                         positions[i] = CGPoint(
                             x: lineOrigin.x + CGFloat(glyphColumn) * cellDimension.width,
@@ -1413,7 +1464,9 @@ extension TerminalView {
                         context.setFillColor(cgColor)
                     }
 
-                    CTFontDrawGlyphs(runFont, runGlyphs, &positions, positions.count, context)
+                    // positions.count == runGlyphsCount; scratchGlyphs may be larger
+                    // (grow-only) so the explicit count bounds the glyph read.
+                    CTFontDrawGlyphs(runFont, scratchGlyphs, &positions, positions.count, context)
 
                     // Draw other attributes
                     drawRunAttributes(runAttributes, glyphPositions: positions, in: context)
@@ -1503,6 +1556,12 @@ extension TerminalView {
         }
         
 #if os(macOS)
+        // Evict cache entries for lines not visited this frame, bounding the
+        // cache (and its retained CTLines) to the currently visible lines.
+        if rowRenderCache.count > terminal.rows {
+            rowRenderCache = rowRenderCache.filter { $0.value.lastSeen == drawFrameCounter }
+        }
+
         // Fills gaps at the end with the default terminal background
         let box = CGRect (x: 0, y: 0, width: bounds.width, height: bounds.height.truncatingRemainder(dividingBy: cellHeight))
         if dirtyRect.intersects(box) {

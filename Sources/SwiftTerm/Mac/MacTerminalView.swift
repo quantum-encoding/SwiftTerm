@@ -161,6 +161,35 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     var colors: [NSColor?] = Array(repeating: nil, count: 256)
     var trueColors: [Attribute.Color:NSColor] = [:]
     var transparent = TTColor.transparent ()
+
+    // Per-run glyph-read scratch buffers, reused across the whole draw pass so the
+    // glyph loop stops allocating a fresh [CGGlyph]/[CGPoint] per run per frame.
+    // Grow-only: after warmup they stabilize at the widest run (≤ cols). Only the
+    // two CoreText READ buffers are scratch — the final `positions` array stays
+    // exactly sized because drawRunAttributes iterates `for p in positions`.
+    var scratchGlyphs: [CGGlyph] = []
+    var scratchCTPositions: [CGPoint] = []
+
+    // Phase 2 — per-row render cache. Keyed by BufferLine IDENTITY (not row
+    // index) so a line that merely scrolls up during streaming reuses its
+    // attributed string + CTLines instead of rebuilding them. A hit requires the
+    // line's renderVersion AND the global renderEpoch (colors/font/link/glyph
+    // mode) to match. Rows in an active selection are never cached (the selection
+    // bg is baked into the attributes); they rebuild every frame as before.
+    // Entries unseen in a frame are evicted, bounding the cache to visible lines.
+    struct CachedRow {
+        let version: UInt64
+        let epoch: UInt64
+        let info: ViewLineInfo
+        let prepared: [(segment: ViewLineSegment, ctLine: CTLine, runs: [CTRun])]
+        var lastSeen: UInt64
+    }
+    var rowRenderCache: [ObjectIdentifier: CachedRow] = [:]
+    var renderEpoch: UInt64 = 0
+    var drawFrameCounter: UInt64 = 0
+    // Debug instrumentation (read by TerminalDrawBench).
+    public var cacheHits = 0
+    public var cacheMisses = 0
     var isBigSur = true
     
     /// This flag is automatically set to true after the initializer is called, if running on a system older than BigSur.
@@ -181,6 +210,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         }
         set {
             fontSet = FontSet (font: newValue)
+            renderEpoch &+= 1   // font is baked into cached CTLine attributes
             resetFont()
             selectNone()
         }
@@ -439,6 +469,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     /// When true, block element (U+2580-U+259F) and box drawing (U+2500-U+257F) characters use custom rendering.
     public var customBlockGlyphs: Bool = true {
         didSet {
+            renderEpoch &+= 1
             terminal.updateFullScreen()
             queuePendingDisplay()
         }
@@ -447,6 +478,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     /// When true, custom block/box glyphs use anti-aliasing instead of pixel-aligned edges.
     public var antiAliasCustomBlockGlyphs: Bool = false {
         didSet {
+            renderEpoch &+= 1
             terminal.updateFullScreen()
             queuePendingDisplay()
         }

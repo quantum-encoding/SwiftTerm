@@ -23,6 +23,11 @@ public final class BufferLine: CustomDebugStringConvertible {
     }
     var isWrapped: Bool
     var renderMode: RenderLineMode = .single
+    /// Monotonic counter bumped on every content mutation. The macOS renderer
+    /// keys a per-line CTLine cache on this: same (line identity, renderVersion)
+    /// ⇒ the cached attributed string + CTLines are reused instead of rebuilt.
+    var renderVersion: UInt64 = 0
+    @inline(__always) func bumpRenderVersion() { renderVersion &+= 1 }
     private var data: UnsafeMutableBufferPointer<CharData>
     private var dataSize: Int
 
@@ -89,6 +94,7 @@ public final class BufferLine: CustomDebugStringConvertible {
             return data [index]
         }
         set(value) {
+            renderVersion &+= 1
             if index >= dataSize {
                 // All bugs I was aware of have been handled, but keep this message here to
                 // help future refactorings.
@@ -106,6 +112,7 @@ public final class BufferLine: CustomDebugStringConvertible {
     }
 
     func clear(with attribute: Attribute) {
+        bumpRenderVersion()
         let empty = CharData(attribute: attribute)
         data.update(repeating: empty)
         images = nil
@@ -132,6 +139,7 @@ public final class BufferLine: CustomDebugStringConvertible {
     ///  - fillData: the data that will be filled into the line
     public func insertCells (pos: Int, n: Int, rightMargin: Int, fillData: CharData)
     {
+        bumpRenderVersion()
         let len = rightMargin + 1
         let pos = pos % len
         if n < len - pos {
@@ -151,6 +159,7 @@ public final class BufferLine: CustomDebugStringConvertible {
     /// Removes the cells at the specified position, shifting data leftwards
     public func deleteCells (pos: Int, n: Int, rightMargin: Int, fillData: CharData)
     {
+        bumpRenderVersion()
         let len = rightMargin + 1
         let p = pos % len
         if n < len - p {
@@ -170,6 +179,7 @@ public final class BufferLine: CustomDebugStringConvertible {
     /// Replaces the cells in the start to end range with the specified fill data
     public func replaceCells (start: Int, end: Int, fillData : CharData)
     {
+        bumpRenderVersion()
         let length = dataSize
         var idx = start
         while idx < end && idx < length {
@@ -186,6 +196,7 @@ public final class BufferLine: CustomDebugStringConvertible {
         if len == cols {
             return
         }
+        bumpRenderVersion()
 
         if cols > len {
             let newBuf = UnsafeMutableBufferPointer<CharData>.allocate(capacity: cols)
@@ -236,6 +247,7 @@ public final class BufferLine: CustomDebugStringConvertible {
     /// Fills the entire bufferline with the specified ``CharData``
     public func fill (with: CharData)
     {
+        bumpRenderVersion()
         data.update(repeating: with)
     }
 
@@ -246,6 +258,7 @@ public final class BufferLine: CustomDebugStringConvertible {
     ///  - len: number of columns to fill
     public func fill (with: CharData, atCol: Int, len: Int)
     {
+        bumpRenderVersion()
         for i in 0..<len {
             data [i+atCol] = with
         }
@@ -254,6 +267,7 @@ public final class BufferLine: CustomDebugStringConvertible {
     /// Fills the current BufferLine with the contents of another BufferLine.
     public func copyFrom (line: BufferLine)
     {
+        bumpRenderVersion()
         let srcSize = line.dataSize
         if data.count < srcSize {
             data.deinitialize()
@@ -296,6 +310,7 @@ public final class BufferLine: CustomDebugStringConvertible {
     ///  - len: the number of elements to copy
     public func copyFrom (_ src: BufferLine, srcCol: Int, dstCol: Int, len: Int)
     {
+        bumpRenderVersion()
         if src === self && srcCol > dstCol {
             // Overlapping forward copy: go left-to-right (already safe)
             for i in 0..<len {
@@ -359,6 +374,7 @@ public final class BufferLine: CustomDebugStringConvertible {
     /// Attaches the specified terminal image to this buffer line.
     /// This method is internal - use Buffer.attachImage() to attach images with proper tracking.
     func attach (image: TerminalImage) {
+        bumpRenderVersion()
         if var imageArray = self.images {
             imageArray.append (image)
             images = imageArray
