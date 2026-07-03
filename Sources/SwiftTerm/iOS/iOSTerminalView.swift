@@ -55,6 +55,13 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     public static var textInputDebugEnabled: Bool = ProcessInfo.processInfo.environment["SWIFTTERM_TEXT_INPUT_DEBUG"] == "1"
     internal static var textInputLogCounter: Int = 0
 
+    // Two CoreText READ scratch buffers (grow-only) reused by the shared
+    // glyph-drawing loop in AppleTerminalView. The CTLine-cache fork added
+    // these to the macOS class only; the shared draw code needs them on iOS
+    // too, so they're declared here as well.
+    var scratchGlyphs: [CGGlyph] = []
+    var scratchCTPositions: [CGPoint] = []
+
     struct FontSet {
         public let normal: UIFont
         let bold: UIFont
