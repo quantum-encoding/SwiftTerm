@@ -939,7 +939,10 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     // doCommand/noop: - but more research needs to take place to figure out the priority
     // of those keys.
     //
-    public override func keyDown(with event: NSEvent) {
+    // `open` (not `public`) so app-side subclasses can intercept keys the
+    // legacy doCommand path can't see — e.g. Shift+Return, whose shift flag
+    // is erased by the time insertNewline: arrives as a bare selector.
+    open override func keyDown(with event: NSEvent) {
         selection.active = false
         let eventFlags = event.modifierFlags
 
